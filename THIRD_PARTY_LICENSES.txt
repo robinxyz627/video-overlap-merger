@@ -1,0 +1,10 @@
+Third-Party Software Notices
+
+1. FFmpeg / FFprobe (bundled in Windows Release packages)
+   - Website: https://ffmpeg.org/
+   - Windows Builds (Gyan.dev): https://www.gyan.dev/ffmpeg/builds/
+   - License: GNU General Public License v3.0 (GPLv3)
+
+2. Pillow (PIL Fork)
+   - Website: https://python-pillow.org/
+   - License: HPND / MIT-CMU License
