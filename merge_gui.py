@@ -24,12 +24,15 @@ from merge_videos import (
     DEFAULT_TRIM_FRAMES,
     VideoInfo,
     calc_trim_seconds,
+    compute_post_guide_tone_params,
     default_output_path,
     expand_input_paths,
     extract_first_last_thumbnails,
     extract_frames_rgb,
     find_executable,
     format_fps,
+    junction_mode_label,
+    normalize_junction_mode,
     numeric_sort_key,
     probe_video,
     run_ffmpeg_merge,
@@ -583,7 +586,10 @@ class VideoMergeGUI:
         self.ffprobe_exe = find_executable("ffprobe")
 
         self.infos: List[VideoInfo] = []
-        self.blend_junctions: List[bool] = []
+        self.blend_junctions: List[str] = []
+        self.junction_frames: List[int] = []
+        self.junction_prev_frames: List[int] = []
+        self.last_nonzero_trim: int = DEFAULT_TRIM_FRAMES
         self.checked_paths: List[Path] = []
         self.is_merging = False
 
@@ -593,6 +599,8 @@ class VideoMergeGUI:
         self._thumb_pending: set[Path] = set()
 
         self.trim_frames_var = tk.IntVar(value=DEFAULT_TRIM_FRAMES)
+        self.sel_frames_var = tk.IntVar(value=DEFAULT_TRIM_FRAMES)
+        self._updating_sel_spin = False
         self.encoder_var = tk.StringVar(value="auto")
         self.output_var = tk.StringVar(value="")
         self.custom_output = False
@@ -656,7 +664,7 @@ class VideoMergeGUI:
         row1 = ttk.Frame(cfg)
         row1.pack(fill=tk.X, pady=(0, 6))
 
-        ttk.Label(row1, text="第2段起重叠/裁剪帧数:").pack(side=tk.LEFT)
+        ttk.Label(row1, text="全局默认重叠/裁剪帧数:").pack(side=tk.LEFT)
         spin = ttk.Spinbox(
             row1,
             from_=0,
@@ -669,7 +677,7 @@ class VideoMergeGUI:
         spin.bind("<KeyRelease>", lambda _e: self._on_trim_changed())
         spin.bind("<FocusOut>", lambda _e: self._on_trim_changed())
 
-        for preset, label in [(22, "22帧(通用)"), (1, "1帧(首尾帧)"), (0, "0帧(直连)")]:
+        for preset, label in [(22, "全部22帧(通用)"), (1, "全部1帧(首尾帧)"), (0, "全部0帧(直连)")]:
             ttk.Button(row1, text=label, command=lambda v=preset: self._set_trim_preset(v)).pack(side=tk.LEFT, padx=2)
 
         self.formula_lbl = ttk.Label(row1, text="", foreground="#1d4ed8")
@@ -693,13 +701,43 @@ class VideoMergeGUI:
         out_entry.bind("<KeyRelease>", lambda _e: setattr(self, "custom_output", True))
         ttk.Button(row2, text="浏览...", command=self.browse_output).pack(side=tk.LEFT)
 
-        mid = ttk.Frame(self.root, padding=(10, 8))
+        mid = ttk.Frame(self.root, padding=(10, 6))
         mid.pack(side=tk.BOTTOM, fill=tk.X)
 
-        ttk.Button(mid, text="打开独立 AB 滑条对照窗口", command=self.open_ab_compare).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(mid, text="切换当前接缝 (硬切 ↔ 色度渐变)", command=self.toggle_selected_junction).pack(side=tk.LEFT, padx=4)
-        ttk.Button(mid, text="全部接缝设为色度渐变", command=lambda: self.set_all_junctions(True)).pack(side=tk.LEFT, padx=4)
-        ttk.Button(mid, text="全部接缝设为硬切去重", command=lambda: self.set_all_junctions(False)).pack(side=tk.LEFT, padx=4)
+        mid_r1 = ttk.Frame(mid)
+        mid_r1.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(mid_r1, text="打开独立 AB 滑条对照窗口", command=self.open_ab_compare).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(
+            mid_r1,
+            text="切换当前接缝 (硬切 ↔ ⭐H3松锚 ↔ 渐变 ↔ 0帧直连)",
+            command=self.toggle_selected_junction,
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            mid_r1,
+            text="当前段设为0帧直连",
+            command=lambda: self.set_selected_junction("direct", 0),
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Label(mid_r1, text="当前段裁剪帧数:").pack(side=tk.LEFT, padx=(10, 2))
+        self.sel_spin = ttk.Spinbox(
+            mid_r1,
+            from_=0,
+            to=500,
+            width=6,
+            textvariable=self.sel_frames_var,
+            command=self._on_sel_frames_changed,
+            state="disabled",
+        )
+        self.sel_spin.pack(side=tk.LEFT, padx=2)
+        self.sel_spin.bind("<KeyRelease>", lambda _e: self._on_sel_frames_changed())
+        self.sel_spin.bind("<FocusOut>", lambda _e: self._on_sel_frames_changed())
+
+        mid_r2 = ttk.Frame(mid)
+        mid_r2.pack(fill=tk.X)
+        ttk.Label(mid_r2, text="批量设置全部接缝:").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(mid_r2, text="全部⭐H3松锚补偿+尾6帧融合", command=lambda: self.set_all_junctions("tone_blend")).pack(side=tk.LEFT, padx=3)
+        ttk.Button(mid_r2, text="全部色度渐变融合", command=lambda: self.set_all_junctions("blend")).pack(side=tk.LEFT, padx=3)
+        ttk.Button(mid_r2, text="全部硬切去重", command=lambda: self.set_all_junctions("cut")).pack(side=tk.LEFT, padx=3)
+        ttk.Button(mid_r2, text="全部0帧直连(不裁剪)", command=lambda: self.set_all_junctions("direct")).pack(side=tk.LEFT, padx=3)
 
         tree_wrap = ttk.Frame(self.root, padding=(10, 0))
         tree_wrap.pack(fill=tk.BOTH, expand=True)
@@ -729,7 +767,7 @@ class VideoMergeGUI:
         self.tree.column("name", width=220, anchor=tk.W)
         self.tree.column("spec", width=250, anchor=tk.W)
         self.tree.column("audio", width=55, anchor=tk.CENTER, stretch=False)
-        self.tree.column("junction", width=210, anchor=tk.CENTER)
+        self.tree.column("junction", width=240, anchor=tk.CENTER)
 
         ysb = ttk.Scrollbar(tree_wrap, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=ysb.set)
@@ -738,6 +776,7 @@ class VideoMergeGUI:
 
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<Double-1>", self._on_tree_double_click)
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
         self._update_formula_and_summary()
 
@@ -807,20 +846,101 @@ class VideoMergeGUI:
         except Exception:
             return DEFAULT_TRIM_FRAMES
 
+    def _safe_sel_frames(self) -> int:
+        try:
+            return max(0, int(self.sel_frames_var.get()))
+        except Exception:
+            return self.last_nonzero_trim
+
     def _set_trim_preset(self, val: int) -> None:
         self.trim_frames_var.set(val)
-        self._on_trim_changed()
-
-    def _on_trim_changed(self) -> None:
+        if val > 0:
+            self.last_nonzero_trim = val
+            for j in range(len(self.blend_junctions)):
+                self.junction_frames[j] = val
+                self.junction_prev_frames[j] = val
+                if self.blend_junctions[j] == "direct":
+                    self.blend_junctions[j] = "cut"
+        else:
+            for j in range(len(self.blend_junctions)):
+                if self.junction_frames[j] > 0:
+                    self.junction_prev_frames[j] = self.junction_frames[j]
+                self.junction_frames[j] = 0
+                self.blend_junctions[j] = "direct"
+        self._sync_sel_spin()
         self._refresh_tree()
         self._update_formula_and_summary()
 
+    def _on_trim_changed(self) -> None:
+        val = self._safe_trim_frames()
+        if val > 0:
+            self.last_nonzero_trim = val
+            for j in range(len(self.blend_junctions)):
+                if self.blend_junctions[j] != "direct":
+                    self.junction_frames[j] = val
+                    self.junction_prev_frames[j] = val
+        else:
+            for j in range(len(self.blend_junctions)):
+                if self.junction_frames[j] > 0:
+                    self.junction_prev_frames[j] = self.junction_frames[j]
+                self.junction_frames[j] = 0
+                self.blend_junctions[j] = "direct"
+        self._sync_sel_spin()
+        self._refresh_tree()
+        self._update_formula_and_summary()
+
+    def _on_sel_frames_changed(self) -> None:
+        if self._updating_sel_spin:
+            return
+        idx = self._selected_index()
+        if idx is None or idx == 0:
+            return
+        j_idx = idx - 1
+        if not (0 <= j_idx < len(self.junction_frames)):
+            return
+        val = self._safe_sel_frames()
+        if val == 0:
+            if self.junction_frames[j_idx] > 0:
+                self.junction_prev_frames[j_idx] = self.junction_frames[j_idx]
+            self.junction_frames[j_idx] = 0
+            self.blend_junctions[j_idx] = "direct"
+        else:
+            self.last_nonzero_trim = val
+            self.junction_frames[j_idx] = val
+            self.junction_prev_frames[j_idx] = val
+            if self.blend_junctions[j_idx] == "direct":
+                self.blend_junctions[j_idx] = "cut"
+        self._refresh_tree(select_idx=idx)
+        self._update_formula_and_summary()
+
+    def _sync_sel_spin(self) -> None:
+        idx = self._selected_index()
+        self._updating_sel_spin = True
+        try:
+            if idx is not None and idx >= 1 and (idx - 1) < len(self.junction_frames):
+                self.sel_frames_var.set(self.junction_frames[idx - 1])
+                self.sel_spin.config(state="normal")
+            else:
+                self.sel_frames_var.set(self._safe_trim_frames())
+                self.sel_spin.config(state="disabled")
+        finally:
+            self._updating_sel_spin = False
+
     def _sync_junctions_len(self) -> None:
         needed = max(0, len(self.infos) - 1)
+        cur_default = self._safe_trim_frames()
+        default_mode = "direct" if cur_default <= 0 else "cut"
+        prev_default = self.last_nonzero_trim if self.last_nonzero_trim > 0 else DEFAULT_TRIM_FRAMES
         if len(self.blend_junctions) < needed:
-            self.blend_junctions.extend([False] * (needed - len(self.blend_junctions)))
+            add_n = needed - len(self.blend_junctions)
+            self.blend_junctions.extend([default_mode] * add_n)
+            self.junction_frames.extend([cur_default] * add_n)
+            self.junction_prev_frames.extend([prev_default] * add_n)
         elif len(self.blend_junctions) > needed:
             self.blend_junctions = self.blend_junctions[:needed]
+            self.junction_frames = self.junction_frames[:needed]
+            self.junction_prev_frames = self.junction_prev_frames[:needed]
+        self._sync_sel_spin()
 
     def add_paths(self, raw_items: Sequence[str], sort_numeric: bool = False) -> None:
         new_paths = expand_input_paths(raw_items)
@@ -908,10 +1028,13 @@ class VideoMergeGUI:
     def clear_all(self) -> None:
         self.infos.clear()
         self.blend_junctions.clear()
+        self.junction_frames.clear()
+        self.junction_prev_frames.clear()
         self.checked_paths.clear()
         self._thumb_cache.clear()
         self.custom_output = False
         self.output_var.set("")
+        self._sync_sel_spin()
         self._refresh_tree()
         self._update_formula_and_summary()
 
@@ -927,7 +1050,6 @@ class VideoMergeGUI:
     def _refresh_tree(self, select_idx: Optional[int] = None) -> None:
         prev_sel = select_idx if select_idx is not None else self._selected_index()
         self.tree.delete(*self.tree.get_children())
-        trim_frames = self._safe_trim_frames()
 
         for i, info in enumerate(self.infos):
             rp = info.path.resolve()
@@ -937,12 +1059,9 @@ class VideoMergeGUI:
             audio = "有" if info.has_audio else "无"
             if i == 0:
                 j_text = "首段 (完整保留)"
-            elif trim_frames == 0:
-                j_text = "无重叠直接拼接"
-            elif self.blend_junctions[i - 1]:
-                j_text = f"色度渐变融合 ({trim_frames}帧)"
             else:
-                j_text = f"硬切去重 (裁前{trim_frames}帧)"
+                jf = self.junction_frames[i - 1]
+                j_text = junction_mode_label(self.blend_junctions[i - 1], jf)
 
             self.tree.insert(
                 "",
@@ -955,6 +1074,7 @@ class VideoMergeGUI:
 
         if prev_sel is not None and 0 <= prev_sel < len(self.infos):
             self.tree.selection_set(str(prev_sel))
+        self._sync_sel_spin()
 
     def _update_formula_and_summary(self) -> None:
         trim_frames = self._safe_trim_frames()
@@ -968,16 +1088,22 @@ class VideoMergeGUI:
         fps_str = format_fps(ref_fps)
         self.formula_lbl.config(text=f"音频裁剪公式(自动): {trim_frames} ÷ {fps_str} fps = {trim_sec:.4f} 秒")
 
-        total_frames = sum(info.frame_count for info in self.infos) - max(0, len(self.infos) - 1) * trim_frames
+        total_frames = sum(info.frame_count for info in self.infos) - sum(self.junction_frames)
         total_frames = max(0, total_frames)
         est_sec = total_frames / float(ref_fps)
-        blend_cnt = sum(1 for x in self.blend_junctions if x) if trim_frames > 0 else 0
+        modes = [normalize_junction_mode(x, self.junction_frames[j]) for j, x in enumerate(self.blend_junctions)]
+        tone_cnt = sum(1 for m in modes if m == "tone_blend")
+        blend_cnt = sum(1 for m in modes if m == "blend")
+        direct_cnt = sum(1 for m in modes if m == "direct")
         self.summary_lbl.config(
             text=(
-                f"共 {len(self.infos)} 段视频 | 已启用色度渐变接缝: {blend_cnt} 处 | "
+                f"共 {len(self.infos)} 段 | ⭐H3松锚: {tone_cnt} 处 | 渐变: {blend_cnt} 处 | 0帧直连: {direct_cnt} 处 | "
                 f"预计成片: {total_frames} 帧（约 {est_sec:.2f} 秒 @ {fps_str} fps）"
             )
         )
+
+    def _on_tree_select(self, _event: tk.Event) -> None:
+        self._sync_sel_spin()
 
     def _on_tree_click(self, event: tk.Event) -> None:
         col = self.tree.identify_column(event.x)
@@ -1003,11 +1129,60 @@ class VideoMergeGUI:
         if idx >= 1:
             self._toggle_junction_at(idx - 1)
 
+    def _restore_nonzero_for_junction(self, j_idx: int) -> int:
+        if self.junction_frames[j_idx] > 0:
+            return self.junction_frames[j_idx]
+        restored = self.junction_prev_frames[j_idx] if self.junction_prev_frames[j_idx] > 0 else self.last_nonzero_trim
+        if restored <= 0:
+            restored = DEFAULT_TRIM_FRAMES
+        self.junction_frames[j_idx] = restored
+        self.junction_prev_frames[j_idx] = restored
+        return restored
+
     def _toggle_junction_at(self, j_idx: int) -> None:
         if 0 <= j_idx < len(self.blend_junctions):
-            self.blend_junctions[j_idx] = not self.blend_junctions[j_idx]
-            self._refresh_tree()
+            cur = normalize_junction_mode(self.blend_junctions[j_idx], self.junction_frames[j_idx])
+            cycle = {"cut": "tone_blend", "tone_blend": "blend", "blend": "direct", "direct": "cut"}
+            nxt = cycle.get(cur, "tone_blend")
+            if nxt == "direct":
+                if self.junction_frames[j_idx] > 0:
+                    self.junction_prev_frames[j_idx] = self.junction_frames[j_idx]
+                self.junction_frames[j_idx] = 0
+                self.blend_junctions[j_idx] = "direct"
+            else:
+                self._restore_nonzero_for_junction(j_idx)
+                self.blend_junctions[j_idx] = nxt
+            self._refresh_tree(select_idx=j_idx + 1)
             self._update_formula_and_summary()
+
+    def set_selected_junction(self, mode: str, frames: Optional[int] = None) -> None:
+        idx = self._selected_index()
+        if idx is None or idx == 0:
+            messagebox.showinfo("提示", "请先选中第 2 段或之后的某一行，再修改它与上一段的衔接方式。", parent=self.root)
+            return
+        j_idx = idx - 1
+        if frames is not None:
+            if frames <= 0:
+                if self.junction_frames[j_idx] > 0:
+                    self.junction_prev_frames[j_idx] = self.junction_frames[j_idx]
+                self.junction_frames[j_idx] = 0
+                self.blend_junctions[j_idx] = "direct"
+            else:
+                self.junction_frames[j_idx] = frames
+                self.junction_prev_frames[j_idx] = frames
+                self.last_nonzero_trim = frames
+                self.blend_junctions[j_idx] = normalize_junction_mode(mode, frames)
+        else:
+            if mode == "direct":
+                if self.junction_frames[j_idx] > 0:
+                    self.junction_prev_frames[j_idx] = self.junction_frames[j_idx]
+                self.junction_frames[j_idx] = 0
+                self.blend_junctions[j_idx] = "direct"
+            else:
+                f = self._restore_nonzero_for_junction(j_idx)
+                self.blend_junctions[j_idx] = normalize_junction_mode(mode, f)
+        self._refresh_tree(select_idx=idx)
+        self._update_formula_and_summary()
 
     def toggle_selected_junction(self) -> None:
         idx = self._selected_index()
@@ -1016,8 +1191,23 @@ class VideoMergeGUI:
             return
         self._toggle_junction_at(idx - 1)
 
-    def set_all_junctions(self, enabled: bool) -> None:
-        self.blend_junctions = [enabled] * max(0, len(self.infos) - 1)
+    def set_all_junctions(self, mode: str | bool) -> None:
+        if mode == "direct":
+            self.trim_frames_var.set(0)
+            for j in range(len(self.blend_junctions)):
+                if self.junction_frames[j] > 0:
+                    self.junction_prev_frames[j] = self.junction_frames[j]
+                self.junction_frames[j] = 0
+                self.blend_junctions[j] = "direct"
+        else:
+            global_f = self._safe_trim_frames()
+            if global_f <= 0:
+                global_f = self.last_nonzero_trim if self.last_nonzero_trim > 0 else DEFAULT_TRIM_FRAMES
+                self.trim_frames_var.set(global_f)
+            self.last_nonzero_trim = global_f
+            for j in range(len(self.blend_junctions)):
+                f = self._restore_nonzero_for_junction(j)
+                self.blend_junctions[j] = normalize_junction_mode(mode, f)
         self._refresh_tree()
         self._update_formula_and_summary()
 
@@ -1041,11 +1231,17 @@ class VideoMergeGUI:
         info_a = self.infos[idx_a]
         info_b = self.infos[idx_b]
         is_adjacent = idx_b == idx_a + 1
-        init_blend = self.blend_junctions[idx_a] if is_adjacent else None
+        j_frames = self.junction_frames[idx_a] if is_adjacent else self._safe_trim_frames()
+        cur_mode = normalize_junction_mode(self.blend_junctions[idx_a], j_frames) if is_adjacent else "cut"
+        init_blend = cur_mode in ("blend", "tone_blend") if is_adjacent else None
 
         def on_toggle(val: bool) -> None:
             if is_adjacent and idx_a < len(self.blend_junctions):
-                self.blend_junctions[idx_a] = val
+                if val:
+                    self._restore_nonzero_for_junction(idx_a)
+                    self.blend_junctions[idx_a] = "tone_blend"
+                else:
+                    self.blend_junctions[idx_a] = "direct" if self.junction_frames[idx_a] == 0 else "cut"
                 self._refresh_tree()
                 self._update_formula_and_summary()
 
@@ -1053,7 +1249,7 @@ class VideoMergeGUI:
             master=self.root,
             info_a=info_a,
             info_b=info_b,
-            overlap_frames=self._safe_trim_frames(),
+            overlap_frames=j_frames,
             ffmpeg_exe=self.ffmpeg_exe,
             initial_blend_enabled=init_blend,
             on_toggle_blend=on_toggle if is_adjacent else None,
@@ -1086,6 +1282,7 @@ class VideoMergeGUI:
         encoder = self.encoder_var.get()
         infos_snapshot = list(self.infos)
         junctions_snapshot = list(self.blend_junctions)
+        jframes_snapshot = list(self.junction_frames)
 
         self.is_merging = True
         self._merge_queue: queue.Queue = queue.Queue()
@@ -1106,6 +1303,7 @@ class VideoMergeGUI:
                     ffmpeg_exe=self.ffmpeg_exe,
                     blend_junctions=junctions_snapshot,
                     log_cb=lambda msg: self._merge_queue.put(("log", msg)),
+                    junction_trim_frames=jframes_snapshot,
                 )
                 elapsed = (datetime.now() - t0).total_seconds()
                 self._merge_queue.put(("done", out_path, elapsed, None))
